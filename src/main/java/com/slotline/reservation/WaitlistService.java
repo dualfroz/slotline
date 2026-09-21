@@ -1,6 +1,8 @@
 package com.slotline.reservation;
 
+import com.slotline.common.AvailabilityViolationException;
 import com.slotline.common.InvalidReservationException;
+import com.slotline.common.SlotConflictException;
 import com.slotline.notification.NotificationMessage;
 import com.slotline.notification.NotificationService;
 import com.slotline.notification.NotificationType;
@@ -19,14 +21,14 @@ import java.util.List;
 public class WaitlistService {
 
     private final WaitlistRepository waitlist;
-    private final ReservationRepository reservations;
+    private final ReservationBooker booker;
     private final ResourceService resources;
     private final NotificationService notifications;
 
-    public WaitlistService(WaitlistRepository waitlist, ReservationRepository reservations, ResourceService resources,
+    public WaitlistService(WaitlistRepository waitlist, ReservationBooker booker, ResourceService resources,
                            NotificationService notifications) {
         this.waitlist = waitlist;
-        this.reservations = reservations;
+        this.booker = booker;
         this.resources = resources;
         this.notifications = notifications;
     }
@@ -51,19 +53,17 @@ public class WaitlistService {
 
     @Transactional
     public void promoteAfterCancellation(Reservation cancelled) {
-        Resource resource = cancelled.getResource();
+        Resource resource = booker.lock(cancelled.getResource().getId());
         List<WaitlistEntry> candidates =
                 waitlist.findWaitingOverlaps(resource.getId(), cancelled.getStartTime(), cancelled.getEndTime());
         for (WaitlistEntry candidate : candidates) {
-            boolean stillFree = reservations
-                    .findActiveOverlaps(resource.getId(), candidate.getStartTime(), candidate.getEndTime())
-                    .isEmpty();
-            if (!stillFree) {
+            Reservation promoted;
+            try {
+                promoted = booker.insert(candidate.getUserId(), resource, candidate.getStartTime(),
+                        candidate.getEndTime(), null);
+            } catch (SlotConflictException | AvailabilityViolationException unavailable) {
                 continue;
             }
-            Reservation promoted = new Reservation(resource, candidate.getUserId(), candidate.getStartTime(),
-                    candidate.getEndTime(), Instant.now());
-            reservations.save(promoted);
             candidate.promote(promoted.getId());
             notifications.dispatch(new NotificationMessage(
                     NotificationType.WAITLIST_PROMOTED,

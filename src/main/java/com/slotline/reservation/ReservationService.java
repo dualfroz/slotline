@@ -1,10 +1,8 @@
 package com.slotline.reservation;
 
-import com.slotline.availability.AvailabilityService;
 import com.slotline.common.ForbiddenOperationException;
 import com.slotline.common.InvalidReservationException;
 import com.slotline.common.NotFoundException;
-import com.slotline.common.SlotConflictException;
 import com.slotline.notification.NotificationMessage;
 import com.slotline.notification.NotificationService;
 import com.slotline.notification.NotificationType;
@@ -21,7 +19,6 @@ import com.slotline.user.Role;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
-import java.time.Instant;
 import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.List;
@@ -32,17 +29,17 @@ public class ReservationService {
 
     private final ReservationRepository reservations;
     private final ResourceRepository resources;
-    private final AvailabilityService availability;
+    private final ReservationBooker booker;
     private final NotificationService notifications;
     private final WaitlistService waitlist;
     private final RecurrenceExpander recurrenceExpander;
 
     public ReservationService(ReservationRepository reservations, ResourceRepository resources,
-                              AvailabilityService availability, NotificationService notifications,
+                              ReservationBooker booker, NotificationService notifications,
                               WaitlistService waitlist, RecurrenceExpander recurrenceExpander) {
         this.reservations = reservations;
         this.resources = resources;
-        this.availability = availability;
+        this.booker = booker;
         this.notifications = notifications;
         this.waitlist = waitlist;
         this.recurrenceExpander = recurrenceExpander;
@@ -51,7 +48,7 @@ public class ReservationService {
     @Transactional
     public ReservationResponse create(AuthenticatedUser actor, ReservationRequest request) {
         Resource resource = lockForBooking(actor, request.resourceId());
-        Reservation reservation = insert(actor.id(), resource, request.startTime(), request.endTime(), null);
+        Reservation reservation = booker.insert(actor.id(), resource, request.startTime(), request.endTime(), null);
         notify(NotificationType.RESERVATION_CREATED, reservation, "Your reservation is confirmed");
         return ReservationResponse.from(reservation);
     }
@@ -67,7 +64,7 @@ public class ReservationService {
         String seriesId = UUID.randomUUID().toString();
         List<ReservationResponse> created = new ArrayList<>();
         for (Occurrence occurrence : occurrences) {
-            Reservation reservation = insert(actor.id(), resource, occurrence.start(), occurrence.end(), seriesId);
+            Reservation reservation = booker.insert(actor.id(), resource, occurrence.start(), occurrence.end(), seriesId);
             created.add(ReservationResponse.from(reservation));
         }
         notifySeries(actor.id(), resource, seriesId, created.size());
@@ -105,31 +102,8 @@ public class ReservationService {
                 .toList();
     }
 
-    private Reservation insert(Long userId, Resource resource, Instant start, Instant end, String seriesId) {
-        if (!start.isBefore(end)) {
-            throw new InvalidReservationException("startTime must be strictly before endTime");
-        }
-        availability.verifyOpen(resource, start, end);
-
-        List<Reservation> overlaps = reservations.findActiveOverlaps(resource.getId(), start, end);
-        if (!overlaps.isEmpty()) {
-            throw new SlotConflictException(
-                    "Slot overlaps an active reservation on resource " + resource.getId());
-        }
-
-        availability.verifyBuffer(resource, start, end);
-
-        Reservation reservation = new Reservation(resource, userId, start, end, Instant.now());
-        if (seriesId != null) {
-            reservation.assignSeries(seriesId);
-        }
-        reservations.save(reservation);
-        return reservation;
-    }
-
     private Resource lockForBooking(AuthenticatedUser actor, Long resourceId) {
-        Resource resource = resources.findByIdForBooking(resourceId)
-                .orElseThrow(() -> new NotFoundException("Resource " + resourceId + " not found"));
+        Resource resource = booker.lock(resourceId);
         ensureSameTenant(actor, resource.getOrganizationId());
         return resource;
     }
