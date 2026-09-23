@@ -1,5 +1,8 @@
 package com.slotline.reservation;
 
+import com.slotline.availability.AvailabilityService;
+import com.slotline.availability.dto.BlackoutRequest;
+import com.slotline.availability.dto.OperatingHoursRequest;
 import com.slotline.notification.NotificationChannel;
 import com.slotline.notification.NotificationMessage;
 import com.slotline.notification.NotificationType;
@@ -23,6 +26,10 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.security.crypto.password.PasswordEncoder;
 
 import java.time.Instant;
+import java.time.LocalDate;
+import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -33,9 +40,14 @@ class WaitlistPromotionTest {
 
     private static final Instant SLOT_START = Instant.parse("2026-10-01T09:00:00Z");
     private static final Instant SLOT_END = Instant.parse("2026-10-01T10:00:00Z");
+    private static final ZoneId zone = ZoneId.of("Europe/Warsaw");
+    private static final LocalDate monday = LocalDate.of(2026, 9, 7);
 
     @Autowired
     private OrganizationRepository organizations;
+
+    @Autowired
+    private AvailabilityService availabilityService;
 
     @Autowired
     private UserRepository users;
@@ -83,6 +95,68 @@ class WaitlistPromotionTest {
         List<WaitlistResponse> waiterEntries = waitlistService.listForUser(waiter.id());
         assertThat(waiterEntries).singleElement()
                 .satisfies(entry -> assertThat(entry.status()).isEqualTo(WaitlistStatus.PROMOTED));
+    }
+
+    @Test
+    void promotionSkipsWaiterOutsideOperatingHoursAndPromotesTheNextOne() {
+        Organization organization = organizations.save(new Organization("waitlist-hours", "waitlist-hours", Instant.now()));
+        AuthenticatedUser holder = user(organization.getId(), "hours-holder");
+        AuthenticatedUser lateWaiter = user(organization.getId(), "hours-late-waiter");
+        AuthenticatedUser fittingWaiter = user(organization.getId(), "hours-fitting-waiter");
+        Long resourceId = resourceService.create(organization.getId(),
+                new ResourceRequest("Morning studio", "open 9-11", zone.getId(), 0)).id();
+        availabilityService.replaceOperatingHours(organization.getId(), resourceId,
+                List.of(new OperatingHoursRequest(monday.getDayOfWeek(), LocalTime.of(9, 0), LocalTime.of(11, 0))));
+
+        ReservationResponse held = reservationService.create(holder,
+                new ReservationRequest(resourceId, at(monday, 10, 0), at(monday, 11, 0)));
+        waitlistService.join(lateWaiter, new WaitlistRequest(resourceId, at(monday, 10, 0), at(monday, 12, 0)));
+        waitlistService.join(fittingWaiter, new WaitlistRequest(resourceId, at(monday, 10, 0), at(monday, 11, 0)));
+
+        recording.clear();
+        reservationService.cancel(holder, held.id());
+
+        assertThat(waitlistService.listForUser(lateWaiter.id())).singleElement()
+                .satisfies(entry -> assertThat(entry.status()).isEqualTo(WaitlistStatus.WAITING));
+        assertThat(reservationService.listForUser(lateWaiter.id())).isEmpty();
+
+        assertThat(waitlistService.listForUser(fittingWaiter.id())).singleElement()
+                .satisfies(entry -> assertThat(entry.status()).isEqualTo(WaitlistStatus.PROMOTED));
+        assertThat(reservationService.listForUser(fittingWaiter.id())).singleElement()
+                .satisfies(reservation -> {
+                    assertThat(reservation.status()).isEqualTo(ReservationStatus.ACTIVE);
+                    assertThat(reservation.endTime()).isEqualTo(at(monday, 11, 0));
+                });
+        assertThat(recording.byType(NotificationType.WAITLIST_PROMOTED)).singleElement()
+                .satisfies(message -> assertThat(message.recipientUserId()).isEqualTo(fittingWaiter.id()));
+    }
+
+    @Test
+    void promotionLeavesWaiterWaitingWhenTheDayIsBlackedOut() {
+        Organization organization = organizations.save(
+                new Organization("waitlist-blackout", "waitlist-blackout", Instant.now()));
+        AuthenticatedUser holder = user(organization.getId(), "blackout-holder");
+        AuthenticatedUser waiter = user(organization.getId(), "blackout-waiter");
+        Long resourceId = resourceService.create(organization.getId(),
+                new ResourceRequest("Hall", "closed for maintenance later", zone.getId(), 0)).id();
+
+        ReservationResponse held = reservationService.create(holder,
+                new ReservationRequest(resourceId, at(monday, 10, 0), at(monday, 11, 0)));
+        waitlistService.join(waiter, new WaitlistRequest(resourceId, at(monday, 10, 0), at(monday, 11, 0)));
+        availabilityService.addBlackout(organization.getId(), resourceId,
+                new BlackoutRequest(monday, monday, "maintenance"));
+
+        recording.clear();
+        reservationService.cancel(holder, held.id());
+
+        assertThat(recording.byType(NotificationType.WAITLIST_PROMOTED)).isEmpty();
+        assertThat(reservationService.listForUser(waiter.id())).isEmpty();
+        assertThat(waitlistService.listForUser(waiter.id())).singleElement()
+                .satisfies(entry -> assertThat(entry.status()).isEqualTo(WaitlistStatus.WAITING));
+    }
+
+    private static Instant at(LocalDate date, int hour, int minute) {
+        return ZonedDateTime.of(date, LocalTime.of(hour, minute), zone).toInstant();
     }
 
     private AuthenticatedUser user(Long organizationId, String username) {
