@@ -1,11 +1,48 @@
 # slotline
 
-A small reservation platform built with Spring Boot. Resources (rooms, courts,
-equipment) are booked for time slots, and the core guarantee is that a single
-slot can never be double-booked, even under heavy concurrency.
+A multi-tenant reservation platform built with Spring Boot. Resources (rooms,
+courts, equipment) are booked for time slots, and the core guarantee is that a
+single slot can never be double-booked, even under heavy concurrency.
 
 The project is deliberately focused on the parts that are hard to get right in a
 booking system: concurrency, transactions, security, and a documented API.
+
+## Features
+
+- No double-booking under concurrency. Booking takes a pessimistic lock on the
+  resource row, runs an overlap check and inserts in one transaction; a clash is
+  rejected with `409 Conflict`. Details below.
+- Multi-tenant. Every user, resource and reservation belongs to an
+  `Organization`. The JWT carries an `org` claim and all resource and
+  reservation queries are scoped to the caller's organization, so a tenant can
+  neither see nor book another tenant's resources (cross-tenant access is a 404).
+  Registration accepts an optional `organizationSlug`; without one the account
+  joins the seeded `default` organization.
+- Recurring reservations. `POST /api/reservations/recurring` takes an RRULE
+  subset (`FREQ=DAILY|WEEKLY`, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`), expands it
+  into concrete slots in the resource time zone, and books the whole series in
+  one transaction (all-or-nothing: any conflict rolls the series back).
+- Availability engine. Per-resource operating hours, blackout date ranges and a
+  buffer (minutes required between reservations). A booking outside the rules is
+  rejected with `422 Unprocessable Entity`; a straight slot clash is still `409`.
+- Waitlist. `POST /api/reservations/waitlist` records interest in a taken slot.
+  When a reservation is cancelled the oldest matching waiter is promoted into a
+  real reservation and notified. Promotion takes the same resource lock and runs
+  the same hours, blackout, overlap and buffer checks as a normal booking; a
+  waiter whose slot fails them is skipped and stays waiting.
+- Notifications. A `NotificationChannel` abstraction fans out on booking,
+  cancellation and waitlist promotion. The email channel logs the message; the
+  webhook channel is enabled only when `slotline.notifications.webhook.url` is
+  set. Tests register a recording channel, so nothing is sent.
+- Resource groups. A nestable group hierarchy per organization; resources are
+  assigned to a group and listed per group.
+- Admin reports. Occupancy of a resource over a time window (reservation count,
+  booked minutes clamped to the window, utilization percent) and the full
+  reservation history including cancelled slots. ADMIN only, tenant-scoped.
+- iCal export. `GET /api/resources/{id}/calendar.ics` and
+  `GET /api/reservations/calendar.ics` return an RFC 5545 feed of active slots.
+- Stateless JWT security with USER and ADMIN roles, RFC 7807 error responses and
+  a Swagger UI for the whole API.
 
 ## Tech stack
 
@@ -14,12 +51,13 @@ booking system: concurrency, transactions, security, and a documented API.
 - Flyway for schema migrations (vendor-specific: H2 for dev/test, PostgreSQL for deploy)
 - H2 in-memory (dev/test), PostgreSQL (deploy profile)
 - springdoc-openapi for Swagger UI
+- Testcontainers for the PostgreSQL migration test
 - Maven Wrapper (`./mvnw`) - no local Maven install required
 
 ## Running it
 
-Prerequisites: a JDK 21. The build uses the Maven Wrapper, so Maven itself does
-not need to be installed.
+Prerequisites: a JDK 21 or newer. The build uses the Maven Wrapper, so Maven
+itself does not need to be installed.
 
 ```bash
 # dev profile (H2 in-memory), starts on http://localhost:8080
@@ -40,18 +78,30 @@ Layered, one package per bounded slice:
 
 ```
 com.slotline
-  config/       SecurityConfig, OpenApiConfig, SlotlineProperties, AdminBootstrap
-  security/     JwtService, JwtAuthenticationFilter, AuthenticatedUser, RestAuthenticationHandlers
-  user/         User, Role, AuthService, AuthController, dto/
-  resource/     Resource, ResourceService, ResourceController, dto/
-  reservation/  Reservation, ReservationService, ReservationController, dto/
-  common/       domain exceptions + GlobalExceptionHandler (RFC 7807 ProblemDetail)
+  config/        SecurityConfig, OpenApiConfig, SlotlineProperties, AdminBootstrap
+  security/      JwtService, JwtAuthenticationFilter, AuthenticatedUser, RestAuthenticationHandlers
+  organization/  Organization (tenant), OrganizationService, OrganizationController, dto/
+  user/          User, Role, AuthService, AuthController, dto/
+  resource/      Resource, ResourceGroup, their services and controllers, dto/
+  availability/  OperatingHours, BlackoutDate, AvailabilityService, AvailabilityController, dto/
+  reservation/   Reservation, WaitlistEntry, ReservationService, WaitlistService, ReservationController, dto/
+  recurrence/    RecurrenceExpander (RRULE subset to concrete occurrences)
+  notification/  NotificationService, NotificationChannel, email and webhook channels
+  report/        AdminReportService, AdminReportController, dto/
+  ical/          ICalService, ICalController
+  common/        domain exceptions + GlobalExceptionHandler (RFC 7807 ProblemDetail)
 ```
 
 - Controllers are thin; all logic and transaction boundaries live in the services.
 - Requests and responses are immutable records; entities never leave the service layer.
 - Errors are returned as `application/problem+json` (ProblemDetail), including
   field-level validation violations.
+
+Migrations live in `src/main/resources/db/migration/{h2,postgresql}`:
+`V1__init.sql` creates users, resources and reservations;
+`V2__organizations_groups_availability_waitlist_series.sql` adds organizations,
+resource groups, operating hours, blackout dates, the waitlist and the
+recurring-series column.
 
 ## No double-booking under concurrency (the core feature)
 
@@ -84,6 +134,9 @@ deterministic across H2 and PostgreSQL and it correctly rejects arbitrary
 overlapping slots, not just byte-identical ones. Optimistic `@Version` is kept as
 a second layer, and the unique index is the last line of defense in production.
 
+Recurring series take the same lock once and check every occurrence inside the
+same transaction, so a series cannot slip past a concurrent single booking.
+
 This is verified by `ReservationConcurrencyTest`: 12 threads are released
 simultaneously against the same slot and the test asserts exactly one success,
 eleven `409`s, and exactly one active reservation in the database. Removing the
@@ -94,19 +147,37 @@ exercises the guarantee.
 
 Authentication is a Bearer JWT obtained from `/api/auth/login`.
 
-| Method | Path                                     | Access      | Notes                         |
-|--------|------------------------------------------|-------------|-------------------------------|
-| POST   | /api/auth/register                       | public      | creates a USER account (201)  |
-| POST   | /api/auth/login                          | public      | returns a JWT                 |
-| GET    | /api/resources                           | USER, ADMIN | list resources                |
-| GET    | /api/resources/{id}                      | USER, ADMIN | single resource               |
-| POST   | /api/resources                           | ADMIN       | create resource (201)         |
-| PUT    | /api/resources/{id}                      | ADMIN       | update resource               |
-| DELETE | /api/resources/{id}                      | ADMIN       | delete resource (204)         |
-| POST   | /api/reservations                        | USER, ADMIN | book a slot (201) or 409      |
-| GET    | /api/reservations/mine                   | USER, ADMIN | caller's reservations         |
-| POST   | /api/reservations/{id}/cancel            | owner/ADMIN | cancel a reservation          |
-| GET    | /api/resources/{resourceId}/reservations | USER, ADMIN | active reservations           |
+| Method | Path                                                  | Access              | Notes                              |
+|--------|-------------------------------------------------------|---------------------|------------------------------------|
+| POST   | /api/auth/register                                    | public              | creates a USER account (201)       |
+| POST   | /api/auth/login                                       | public              | returns a JWT                      |
+| GET    | /api/organizations                                    | ADMIN               | list organizations                 |
+| POST   | /api/organizations                                    | ADMIN               | create organization (201)          |
+| GET    | /api/resources                                        | USER, ADMIN         | list resources                     |
+| GET    | /api/resources/{id}                                   | USER, ADMIN         | single resource                    |
+| POST   | /api/resources                                        | ADMIN               | create resource (201)              |
+| PUT    | /api/resources/{id}                                   | ADMIN               | update resource                    |
+| DELETE | /api/resources/{id}                                   | ADMIN               | delete resource (204)              |
+| GET    | /api/resources/{id}/operating-hours                   | USER, ADMIN         | weekly opening hours               |
+| PUT    | /api/resources/{id}/operating-hours                   | ADMIN               | replace opening hours              |
+| GET    | /api/resources/{id}/blackouts                         | USER, ADMIN         | blackout date ranges               |
+| POST   | /api/resources/{id}/blackouts                         | ADMIN               | add blackout (201)                 |
+| DELETE | /api/resources/{id}/blackouts/{blackoutId}            | ADMIN               | remove blackout (204)              |
+| GET    | /api/resources/{resourceId}/reservations              | USER, ADMIN         | active reservations                |
+| GET    | /api/resources/{id}/calendar.ics                      | USER, ADMIN         | iCal feed of a resource            |
+| GET    | /api/resource-groups                                  | USER, ADMIN         | list groups                        |
+| POST   | /api/resource-groups                                  | ADMIN               | create group, optionally nested    |
+| POST   | /api/resource-groups/{groupId}/resources/{resourceId} | ADMIN               | assign resource to group           |
+| GET    | /api/resource-groups/{groupId}/resources              | USER, ADMIN         | resources directly in a group      |
+| POST   | /api/reservations                                     | USER, ADMIN         | book a slot (201), 409 or 422      |
+| POST   | /api/reservations/recurring                           | USER, ADMIN         | book a recurring series (201)      |
+| GET    | /api/reservations/mine                                | USER, ADMIN         | caller's reservations              |
+| POST   | /api/reservations/{id}/cancel                         | owner/ADMIN         | cancel, promotes the next waiter   |
+| POST   | /api/reservations/waitlist                            | USER, ADMIN         | join the waitlist for a slot (201) |
+| GET    | /api/reservations/waitlist/mine                       | USER, ADMIN         | caller's waitlist entries          |
+| GET    | /api/reservations/calendar.ics                        | USER, ADMIN         | iCal feed of the caller's bookings |
+| GET    | /api/admin/reports/resources/{id}/occupancy           | ADMIN               | `from` and `until` query params    |
+| GET    | /api/admin/reports/resources/{id}/history             | ADMIN               | all reservations, any status       |
 
 ## curl examples
 
@@ -147,6 +218,10 @@ curl -s -X POST http://localhost:8080/api/reservations \
 curl -s -o /dev/null -w '%{http_code}\n' -X POST http://localhost:8080/api/reservations \
   -H "Authorization: Bearer $USER_TOKEN" -H 'Content-Type: application/json' \
   -d '{"resourceId":1,"startTime":"2026-09-01T10:00:00Z","endTime":"2026-09-01T11:00:00Z"}'
+
+# occupancy of the resource over a window (ADMIN only)
+curl -s "http://localhost:8080/api/admin/reports/resources/1/occupancy?from=2026-09-01T08:00:00Z&until=2026-09-01T18:00:00Z" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
 
 ## Testing
@@ -160,6 +235,16 @@ Suite:
 - `JwtServiceTest` - token issue/parse round trip and rejection of tokens signed with another key.
 - `ReservationApiTest` - full HTTP flow through Spring Security: register, login, role enforcement (USER cannot create resources), book, 409 on conflict, cancel, and re-book after cancel.
 - `ReservationConcurrencyTest` - the concurrency guarantee described above.
+- `TenantIsolationTest` - a tenant can neither see nor book another tenant's resources.
+- `RecurrenceExpanderTest` - RRULE expansion: daily with interval and count, weekly by day, `UNTIL` boundary, rejection of unbounded rules.
+- `RecurringReservationTest` - a weekly series books distinct slots; a series with one conflicting slot is rolled back whole.
+- `AvailabilityRulesTest` - operating hours, buffer and blackout ranges reject bookings with 422.
+- `WaitlistPromotionTest` - cancelling promotes the oldest waiter and sends a notification; a waiter whose slot breaks operating hours or a blackout is skipped and stays waiting.
+- `WaitlistPromotionConcurrencyTest` - promotion waits for the resource lock held by a concurrent booking and does not double-book the slot it took.
+- `ResourceGroupApiTest` - nested groups, resource assignment, per-group listing, role enforcement, validation, and tenant isolation of groups.
+- `AdminReportApiTest` - occupancy clamped to the window with cancelled slots excluded, history including cancelled slots, ADMIN-only access, and tenant isolation.
+- `ICalExportTest` - resource and user feeds contain the booked slot as a VEVENT.
+- `PostgresMigrationTest` - boots a real PostgreSQL container with Testcontainers, applies the `postgresql` migrations and asserts the partial unique index keeps a single ACTIVE reservation per slot. It self-skips (JUnit assumption) when Docker is not reachable, so the H2 suite always runs.
 - `SlotlineApplicationTests` - context loads.
 
 ## Docker
@@ -184,79 +269,33 @@ database (useful for a quick demo, not for real data).
 
 All values are overridable by environment variable:
 
-| Variable                  | Default                | Purpose                            |
-|---------------------------|------------------------|------------------------------------|
-| SLOTLINE_JWT_SECRET       | dev-only placeholder   | HMAC signing key (set in prod)     |
-| SLOTLINE_ADMIN_USERNAME   | admin                  | seeded admin username              |
-| SLOTLINE_ADMIN_PASSWORD   | admin12345             | seeded admin password (set in prod)|
-| SPRING_PROFILES_ACTIVE    | (dev / H2)             | set to `postgres` for deploy       |
-| SLOTLINE_DB_URL           | localhost postgres     | JDBC url (postgres profile)        |
-| SLOTLINE_DB_USERNAME       | slotline               | DB user (postgres profile)         |
-| SLOTLINE_DB_PASSWORD       | slotline               | DB password (postgres profile)     |
+| Variable                            | Default              | Purpose                              |
+|-------------------------------------|----------------------|--------------------------------------|
+| SLOTLINE_JWT_SECRET                 | dev-only placeholder | HMAC signing key (set in prod)       |
+| SLOTLINE_ADMIN_USERNAME             | admin                | seeded admin username                |
+| SLOTLINE_ADMIN_PASSWORD             | admin12345           | seeded admin password (set in prod)  |
+| SLOTLINE_NOTIFICATIONS_WEBHOOK_URL  | (unset)              | enables the webhook notification channel |
+| SPRING_PROFILES_ACTIVE              | (dev / H2)           | set to `postgres` for deploy         |
+| SLOTLINE_DB_URL                     | localhost postgres   | JDBC url (postgres profile)          |
+| SLOTLINE_DB_USERNAME                | slotline             | DB user (postgres profile)           |
+| SLOTLINE_DB_PASSWORD                | slotline             | DB password (postgres profile)       |
 
 The dev JWT secret and admin password are for local use only and must be
 overridden before any real deployment.
 
-## Wave 2 (depth)
+## Limitations
 
-Wave 2 is additive: the v1 anti-double-booking core (pessimistic lock plus
-overlap check plus the PostgreSQL partial unique index) is untouched and its
-concurrency test still passes. New capabilities:
+- Payments and a separate frontend are out of scope; Swagger UI is the console.
+- The email notification channel only logs messages; real delivery needs an SMTP
+  implementation of `NotificationChannel` or the webhook channel.
+- Calendar integration is a one-way iCal export; there is no two-way sync with
+  external calendars.
+- Recurrence supports the RRULE subset listed above (`DAILY` and `WEEKLY` only).
+- Group listing returns resources assigned directly to a group, not those of its
+  child groups.
+- Any organization `ADMIN` can list and create organizations; there is no separate
+  platform-admin role.
 
-- Multi-tenant. Every user, resource and reservation belongs to an
-  `Organization`. The JWT carries an `org` claim and all resource and
-  reservation queries are scoped to the caller's organization, so a tenant can
-  neither see nor book another tenant's resources (cross-tenant access is a 404).
-  Registration accepts an optional `organizationSlug`; without one the account
-  joins the seeded `default` organization.
-- Recurring reservations. `POST /api/reservations/recurring` takes an RRULE
-  subset (`FREQ=DAILY|WEEKLY`, `INTERVAL`, `COUNT`, `UNTIL`, `BYDAY`), expands it
-  into concrete slots in the resource time zone, and books the whole series in
-  one transaction (all-or-nothing: any conflict rolls the series back).
-- Availability engine. Per-resource operating hours, blackout date ranges and a
-  buffer (minutes required between reservations). A booking outside the rules is
-  rejected with `422 Unprocessable Entity`; a straight slot clash is still `409`.
-- Waitlist. `POST /api/reservations/waitlist` records interest in a taken slot.
-  When a reservation is cancelled the oldest matching waiter is promoted into a
-  real reservation and notified.
-- Notifications. A `NotificationChannel` abstraction (email channel logs;
-  webhook channel is enabled only when `slotline.notifications.webhook.url` is
-  set) fans out on booking, cancellation and waitlist promotion. Fully testable
-  without sending anything by registering a recording channel.
-- Resource groups. Nestable `resource-group` hierarchy with resource assignment.
-- Admin reports. `GET /api/admin/reports/resources/{id}/occupancy?from=..&until=..`
-  and `.../history` (ADMIN only, tenant-scoped).
-- iCal export. `GET /api/resources/{id}/calendar.ics` and
-  `GET /api/reservations/calendar.ics` return an RFC 5545 feed of active slots.
+## License
 
-New endpoints (all under the existing JWT security):
-
-| Method | Path                                                | Access      |
-|--------|-----------------------------------------------------|-------------|
-| GET    | /api/organizations                                  | ADMIN       |
-| POST   | /api/organizations                                  | ADMIN       |
-| POST   | /api/reservations/recurring                          | USER, ADMIN |
-| POST   | /api/reservations/waitlist                           | USER, ADMIN |
-| GET    | /api/reservations/waitlist/mine                      | USER, ADMIN |
-| GET    | /api/reservations/calendar.ics                       | USER, ADMIN |
-| GET    | /api/resources/{id}/calendar.ics                     | USER, ADMIN |
-| GET/PUT| /api/resources/{id}/operating-hours                  | GET all, PUT ADMIN |
-| GET/POST| /api/resources/{id}/blackouts                       | GET all, POST ADMIN |
-| DELETE | /api/resources/{id}/blackouts/{blackoutId}           | ADMIN       |
-| GET/POST| /api/resource-groups                                | GET all, POST ADMIN |
-| POST   | /api/resource-groups/{groupId}/resources/{resourceId}| ADMIN       |
-| GET    | /api/resource-groups/{groupId}/resources             | USER, ADMIN |
-| GET    | /api/admin/reports/resources/{id}/occupancy          | ADMIN       |
-| GET    | /api/admin/reports/resources/{id}/history            | ADMIN       |
-
-### PostgreSQL migration verification (Testcontainers)
-
-`PostgresMigrationTest` boots a real PostgreSQL container, applies the
-`postgresql` migrations and asserts the partial unique index enforces a single
-ACTIVE reservation per slot. It self-skips (JUnit assumption) when Docker is not
-reachable, so the H2 suite always runs.
-
-## Non-goals (v1)
-
-Payments, a separate frontend (Swagger UI is the console), notifications, and
-external calendar sync are intentionally out of scope.
+MIT, see [LICENSE](LICENSE).
